@@ -1,0 +1,15 @@
+# vídeos/gifs baixados durante testes
+*.mp4
+*.m4a
+*.webm
+*.gif
+*.part
+*.ytdl
+# sistema / editores
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*~

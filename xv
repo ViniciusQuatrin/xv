@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# xv — baixa o vídeo de um post do X/Twitter e copia o ARQUIVO para a área de transferência.
+# Uso: xv [-g] <link>     (-g converte para .gif)
+# macOS + Linux. https://github.com/ViniciusQuatrin/xv
+# Compatível com bash 3.2 (o bash padrão do macOS).
+
+set -u
+
+uso() { echo "uso: xv [-g] <link>" >&2; exit 1; }
+erro() { echo "$*" >&2; exit 1; }
+
+GIF=0
+case "${1:-}" in
+  -g|--gif) GIF=1; shift ;;
+  -h|--help) echo "uso: xv [-g] <link>"; echo "  -g  converte o vídeo para .gif"; exit 0 ;;
+esac
+[ -z "${1:-}" ] && uso
+URL="$1"
+
+OS="$(uname -s)"
+
+# --- pasta de destino --------------------------------------------------------
+if [ -n "${XV_DIR:-}" ]; then
+  DIR="$XV_DIR"
+elif [ "$OS" = "Darwin" ]; then
+  DIR="$HOME/Movies/twitter-videos"
+else
+  VIDS="${XDG_VIDEOS_DIR:-}"
+  if [ -z "$VIDS" ] && command -v xdg-user-dir >/dev/null 2>&1; then
+    VIDS="$(xdg-user-dir VIDEOS 2>/dev/null || true)"
+    # xdg-user-dir devolve $HOME quando a pasta não está configurada
+    [ "$VIDS" = "$HOME" ] && VIDS=""
+  fi
+  DIR="${VIDS:-$HOME/Videos}/twitter-videos"
+fi
+mkdir -p "$DIR" || erro "não consegui criar a pasta $DIR"
+
+# --- dependências ------------------------------------------------------------
+command -v yt-dlp >/dev/null 2>&1 || erro "yt-dlp não encontrado. Instale: https://github.com/yt-dlp/yt-dlp#installation"
+command -v ffmpeg >/dev/null 2>&1 || erro "ffmpeg não encontrado (necessário para juntar áudio/vídeo e gerar gif)."
+
+# --- download ----------------------------------------------------------------
+OUT=$(yt-dlp -q --no-warnings \
+  -f "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b" --merge-output-format mp4 \
+  -o "$DIR/%(id)s.%(ext)s" --print after_move:filepath "$URL") || erro "falhou ao baixar"
+[ -n "$OUT" ] || erro "falhou ao baixar"
+
+# Um post pode ter mais de um vídeo: yt-dlp imprime um caminho por linha.
+FILES=()
+while IFS= read -r line; do
+  [ -n "$line" ] && FILES+=("$line")
+done <<<"$OUT"
+[ "${#FILES[@]}" -gt 0 ] || erro "falhou ao baixar"
+
+# --- gif ---------------------------------------------------------------------
+if [ "$GIF" = 1 ]; then
+  i=0
+  for f in "${FILES[@]}"; do
+    g="${f%.*}.gif"
+    ffmpeg -nostdin -y -loglevel error -i "$f" \
+      -vf "fps=15,scale='min(480,iw)':-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" \
+      "$g" || erro "falhou ao converter"
+    rm -f "$f"
+    FILES[i]="$g"
+    i=$((i + 1))
+  done
+fi
+
+# --- área de transferência ---------------------------------------------------
+# file:// URI com percent-encoding (RFC 8089 / text/uri-list)
+file_uri() {
+  local LC_ALL=C s="$1" out="" c i
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      [A-Za-z0-9/._~-]) out+="$c" ;;
+      *) out+=$(printf '%%%02X' "'$c") ;;
+    esac
+  done
+  printf 'file://%s' "$out"
+}
+
+copiar_macos() {
+  if [ "${#FILES[@]}" -eq 1 ]; then
+    # Mesmo comportamento da versão original
+    local esc="${FILES[0]//\\/\\\\}"; esc="${esc//\"/\\\"}"
+    osascript -e "set the clipboard to (POSIX file \"$esc\")" >/dev/null
+  else
+    # Vários arquivos: NSPasteboard com uma lista de NSURL (via JXA)
+    osascript -l JavaScript - "${FILES[@]}" >/dev/null <<'JXA'
+ObjC.import('AppKit');
+function run(argv) {
+  var pb = $.NSPasteboard.generalPasteboard;
+  pb.clearContents;
+  var arr = $.NSMutableArray.array;
+  for (var i = 0; i < argv.length; i++) arr.addObject($.NSURL.fileURLWithPath(argv[i]));
+  pb.writeObjects(arr);
+}
+JXA
+  fi
+}
+
+copiar_linux() {
+  # Formato:
+  #   uri     -> text/uri-list (padrão; KDE/Dolphin, Thunar, Nemo, PCManFM, Nautilus recente,
+  #              Telegram, Discord e outros apps que aceitam colar arquivos)
+  #   gnome   -> x-special/gnome-copied-files (Nautilus antigo / Caja / alguns GTK)
+  # Mude com XV_CLIP=gnome. xclip/wl-copy só oferecem UM formato por vez.
+  local fmt="${XV_CLIP:-uri}" type data="" f
+  if [ "$fmt" = "gnome" ]; then
+    type="x-special/gnome-copied-files"
+    data="copy"
+    for f in "${FILES[@]}"; do data+=$'\n'"$(file_uri "$f")"; done
+  else
+    type="text/uri-list"
+    for f in "${FILES[@]}"; do data+="$(file_uri "$f")"$'\r\n'; done
+  fi
+
+  if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-copy >/dev/null 2>&1; then
+    printf '%s' "$data" | wl-copy --type "$type"
+  elif [ -n "${DISPLAY:-}" ] && command -v xclip >/dev/null 2>&1; then
+    printf '%s' "$data" | xclip -selection clipboard -t "$type" -i >/dev/null 2>&1
+  elif [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    echo "⚠️  wl-copy não encontrado. Instale o pacote wl-clipboard (ex.: sudo apt install wl-clipboard)." >&2
+    return 2
+  elif [ -n "${DISPLAY:-}" ]; then
+    echo "⚠️  xclip não encontrado. Instale o pacote xclip (ex.: sudo apt install xclip)." >&2
+    return 2
+  else
+    echo "⚠️  sem sessão gráfica (DISPLAY/WAYLAND_DISPLAY vazios): não dá para usar a área de transferência." >&2
+    return 2
+  fi
+}
+
+case "$OS" in
+  Darwin) copiar_macos; RC=$? ;;
+  *) copiar_linux; RC=$? ;;
+esac
+
+if [ "$RC" -ne 0 ]; then
+  [ "$RC" -eq 2 ] || echo "⚠️  falhou ao copiar para a área de transferência." >&2
+  for f in "${FILES[@]}"; do echo "arquivo salvo em: $f"; done
+  exit 2
+fi
+
+for f in "${FILES[@]}"; do echo "✅ copiado: $f"; done
